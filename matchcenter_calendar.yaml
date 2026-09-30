@@ -1,0 +1,524 @@
+###############################################################################
+# MatchCenter Calendar Sync
+#
+# Fetches upcoming matches from the SPORT24 / 24Media MatchCenter GraphQL API
+# and creates events in a Home Assistant calendar.
+#
+# Required secret in /config/secrets.yaml:
+#
+#   matchcenter_api_key: "YOUR_API_KEY"
+#
+###############################################################################
+
+
+###############################################################################
+# REST COMMAND
+#
+# Fetch only one date at a time.
+# This keeps the API response small enough for Home Assistant templates.
+###############################################################################
+
+rest_command:
+  matchcenter_fetch_events_by_date:
+    url: 'https://matchcenter-api.24media.gr/v1/api-graphql?apikey={{ api_key | urlencode }}&query={{ ("{ sportEventsByDate(date: \"" ~ date ~ "\") { sportRadarEventId sportType startDate tournament competitors { teamName sportRadarCompetitorId qualifier } } }") | urlencode }}'
+    method: GET
+    timeout: 30
+
+
+###############################################################################
+# SCRIPT
+###############################################################################
+
+script:
+  matchcenter_sync_calendar:
+    alias: MatchCenter to Calendar Sync
+    description: >
+      Fetch upcoming matches from the SPORT24 MatchCenter API and add
+      selected teams to a Home Assistant calendar.
+    mode: single
+
+    sequence:
+
+      #########################################################################
+      # USER CONFIGURATION
+      #########################################################################
+
+      - variables:
+
+          # Target Home Assistant calendar.
+          calendar_entity_id: calendar.matchday
+
+          # Import matches from now until X days ahead.
+          #
+          # A short window helps reduce stale events when fixtures
+          # are rescheduled.
+          days_ahead: 7
+
+          # API key stored in secrets.yaml.
+          api_key: !secret matchcenter_api_key
+
+          # Sports and teams to track.
+          #
+          # competitor_id is the Sportradar competitor ID.
+          #
+          # To add another team, add it under the appropriate sport.
+          sports:
+
+            - sport: soccer
+              emoji: "⚽"
+              duration_minutes: 120
+
+              teams:
+
+                - name: Panathinaikos FC
+                  competitor_id: "sr:competitor:3248"
+
+                - name: Greece Men's National Football Team
+                  competitor_id: "sr:competitor:4710"
+
+
+            - sport: basketball
+              emoji: "🏀"
+              duration_minutes: 150
+
+              teams:
+
+                - name: Panathinaikos BC
+                  competitor_id: "sr:competitor:3508"
+
+                - name: Greece Men's National Basketball Team
+                  competitor_id: "sr:competitor:6128"
+
+
+      #########################################################################
+      # BUILD LIST OF DATES TO FETCH
+      #
+      # days_ahead: 7 means:
+      # today + the following 7 days.
+      #########################################################################
+
+      - variables:
+
+          fetch_dates: >-
+            {% set ns = namespace(dates=[]) %}
+
+            {% for offset in range(0, days_ahead + 1) %}
+              {% set ns.dates =
+                ns.dates
+                + [
+                    (
+                      now()
+                      + timedelta(days=offset)
+                    ).strftime('%Y-%m-%d')
+                  ]
+              %}
+            {% endfor %}
+
+            {{ ns.dates }}
+
+
+      #########################################################################
+      # READ EXISTING CALENDAR EVENTS
+      #########################################################################
+
+      - action: calendar.get_events
+        target:
+          entity_id: "{{ calendar_entity_id }}"
+        data:
+          start_date_time: "{{ now().isoformat() }}"
+          end_date_time: >-
+            {{
+              (
+                now()
+                + timedelta(days=days_ahead + 1)
+              ).isoformat()
+            }}
+        response_variable: existing_calendar_response
+
+
+      - variables:
+
+          existing_calendar_events: >-
+            {{
+              existing_calendar_response
+              .get(calendar_entity_id, {})
+              .get('events', [])
+              or []
+            }}
+
+
+      #########################################################################
+      # FETCH EACH DATE
+      #########################################################################
+
+      - repeat:
+          for_each: "{{ fetch_dates }}"
+
+          sequence:
+
+            ###################################################################
+            # Save date because nested repeats also use repeat.item
+            ###################################################################
+
+            - variables:
+
+                current_date: "{{ repeat.item }}"
+
+
+            ###################################################################
+            # FETCH API
+            ###################################################################
+
+            - action: rest_command.matchcenter_fetch_events_by_date
+              data:
+                api_key: "{{ api_key }}"
+                date: "{{ current_date }}"
+              response_variable: matchcenter_response
+
+
+            ###################################################################
+            # PROCESS ONLY VALID RESPONSES
+            ###################################################################
+
+            - if:
+
+                - condition: template
+                  value_template: >-
+                    {{
+                      matchcenter_response.status | int == 200
+                      and matchcenter_response.content is mapping
+                      and matchcenter_response.content.get('data') is mapping
+                      and
+                      matchcenter_response.content['data'].get(
+                        'sportEventsByDate'
+                      ) is not none
+                    }}
+
+              then:
+
+                ################################################################
+                # LOOP DIRECTLY OVER THE DAILY RESPONSE
+                #
+                # Important:
+                # Do NOT first copy the whole response into another template
+                # variable. This avoids Home Assistant's template size limit.
+                ################################################################
+
+                - repeat:
+                    for_each: >-
+                      {{
+                        matchcenter_response['content']['data']
+                        ['sportEventsByDate']
+                        or []
+                      }}
+
+                    sequence:
+
+                      ##########################################################
+                      # SAVE CURRENT MATCH
+                      ##########################################################
+
+                      - variables:
+
+                          match: "{{ repeat.item }}"
+
+                          match_id: >-
+                            {{
+                              repeat.item.get(
+                                'sportRadarEventId',
+                                ''
+                              )
+                            }}
+
+                          match_sport: >-
+                            {{
+                              repeat.item.get(
+                                'sportType',
+                                ''
+                              )
+                            }}
+
+                          competitor_ids: >-
+                            {{
+                              repeat.item.get(
+                                'competitors',
+                                []
+                              )
+                              | map(
+                                  attribute='sportRadarCompetitorId'
+                                )
+                              | list
+                            }}
+
+
+                      ##########################################################
+                      # FIND CONFIGURATION FOR THIS SPORT
+                      ##########################################################
+
+                      - variables:
+
+                          sport_config_matches: >-
+                            {{
+                              sports
+                              | selectattr(
+                                  'sport',
+                                  'eq',
+                                  match_sport
+                                )
+                              | list
+                            }}
+
+
+                      ##########################################################
+                      # CONTINUE ONLY FOR CONFIGURED SPORTS
+                      ##########################################################
+
+                      - if:
+
+                          - condition: template
+                            value_template: >-
+                              {{
+                                sport_config_matches
+                                | count > 0
+                              }}
+
+                        then:
+
+                          - variables:
+
+                              current_sport: >-
+                                {{
+                                  sport_config_matches[0]
+                                }}
+
+                              tracked_competitor_ids: >-
+                                {{
+                                  sport_config_matches[0].teams
+                                  | map(
+                                      attribute='competitor_id'
+                                    )
+                                  | list
+                                }}
+
+
+                          ######################################################
+                          # CHECK WHETHER A TRACKED TEAM IS PLAYING
+                          ######################################################
+
+                          - variables:
+
+                              tracked_match: >-
+                                {{
+                                  competitor_ids
+                                  | select(
+                                      'in',
+                                      tracked_competitor_ids
+                                    )
+                                  | list
+                                  | count > 0
+                                }}
+
+                              match_marker: >-
+                                MATCHCENTER_ID={{ match_id }}
+
+
+                          ######################################################
+                          # CHECK WHETHER EVENT ALREADY EXISTS
+                          ######################################################
+
+                          - variables:
+
+                              already_exists: >-
+                                {% set ns = namespace(found=false) %}
+
+                                {% for calendar_event
+                                     in existing_calendar_events %}
+
+                                  {% set description =
+                                    calendar_event.get(
+                                      'description',
+                                      ''
+                                    )
+                                    or ''
+                                  %}
+
+                                  {% if match_marker in description %}
+                                    {% set ns.found = true %}
+                                  {% endif %}
+
+                                {% endfor %}
+
+                                {{ ns.found }}
+
+
+                          ######################################################
+                          # CREATE ONLY NEW TRACKED MATCHES
+                          ######################################################
+
+                          - if:
+
+                              - condition: template
+                                value_template: >-
+                                  {{
+                                    tracked_match
+                                    and match_id | length > 0
+                                    and not already_exists
+                                  }}
+
+                            then:
+
+                              ##################################################
+                              # HOME / AWAY
+                              ##################################################
+
+                              - variables:
+
+                                  home_candidates: >-
+                                    {{
+                                      match.get(
+                                        'competitors',
+                                        []
+                                      )
+                                      | selectattr(
+                                          'qualifier',
+                                          'eq',
+                                          'home'
+                                        )
+                                      | list
+                                    }}
+
+                                  away_candidates: >-
+                                    {{
+                                      match.get(
+                                        'competitors',
+                                        []
+                                      )
+                                      | selectattr(
+                                          'qualifier',
+                                          'eq',
+                                          'away'
+                                        )
+                                      | list
+                                    }}
+
+
+                              - variables:
+
+                                  home_team: >-
+                                    {% if home_candidates | count > 0 %}
+                                      {{ home_candidates[0].teamName }}
+                                    {% elif match.competitors | count > 0 %}
+                                      {{ match.competitors[0].teamName }}
+                                    {% else %}
+                                      Unknown
+                                    {% endif %}
+
+                                  away_team: >-
+                                    {% if away_candidates | count > 0 %}
+                                      {{ away_candidates[0].teamName }}
+                                    {% elif match.competitors | count > 1 %}
+                                      {{ match.competitors[1].teamName }}
+                                    {% else %}
+                                      Unknown
+                                    {% endif %}
+
+                                  competition_name: >-
+                                    {{
+                                      match
+                                      .get(
+                                        'tournament',
+                                        ''
+                                      )
+                                      | trim
+                                    }}
+
+
+                              ##################################################
+                              # BUILD EVENT
+                              ##################################################
+
+                              - variables:
+
+                                  event_summary: >-
+                                    {{
+                                      current_sport.emoji
+                                      ~ ' '
+                                      ~ home_team
+                                      ~ ' - '
+                                      ~ away_team
+                                    }}
+
+                                  event_start: >-
+                                    {{ match.startDate }}
+
+                                  event_end: >-
+                                    {{
+                                      (
+                                        match.startDate
+                                        | as_datetime
+                                        +
+                                        timedelta(
+                                          minutes=
+                                            current_sport
+                                            .duration_minutes
+                                        )
+                                      ).isoformat()
+                                    }}
+
+                                  event_description: |-
+                                    MATCHCENTER_ID={{ match_id }}
+
+
+                              ##################################################
+                              # CREATE CALENDAR EVENT
+                              ##################################################
+
+                              - action: calendar.create_event
+                                target:
+                                  entity_id: "{{ calendar_entity_id }}"
+                                data:
+                                  summary: "{{ event_summary }}"
+                                  location: '{{ competition_name | default('''') }}'
+                                  description: "{{ event_description }}"
+                                  start_date_time: "{{ event_start }}"
+                                  end_date_time: "{{ event_end }}"
+
+
+###############################################################################
+# AUTOMATION
+###############################################################################
+
+automation:
+
+  - id: matchcenter_calendar_auto_sync
+    alias: MatchCenter - Automatic calendar sync
+    description: >
+      Synchronize upcoming MatchCenter events twice per day and
+      after Home Assistant starts.
+
+    mode: single
+
+    triggers:
+
+      - trigger: time
+        at: "06:00:00"
+
+
+    actions:
+
+      #########################################################################
+      # Give calendar/network integrations time to initialize after startup.
+      #########################################################################
+
+      - if:
+
+          - condition: template
+            value_template: >-
+              {{ trigger.platform == 'homeassistant' }}
+
+        then:
+
+          - delay: "00:01:00"
+
+
+      - action: script.matchcenter_sync_calendar
